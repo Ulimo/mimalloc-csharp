@@ -109,8 +109,9 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - run: |
-          mkdir build && cd build
-          cmake .. -G "Visual Studio 17 2022" -A x64
+          mkdir build
+          cd build
+          cmake .. -A x64
           cmake --build . --config Release
           copy Release\mimalloc.dll ..\mimalloc.dll
           copy ..\bin\mimalloc-redirect.dll ..\mimalloc-redirect.dll
