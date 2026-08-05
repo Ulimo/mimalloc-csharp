@@ -294,26 +294,61 @@ jobs:
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
+
+      # Puts cl.exe / link.exe on PATH. Required by the Ninja generator below.
       - uses: ilammy/msvc-dev-cmd@v1
-      - run: |
-          mkdir build
-          cd build
-          cmake .. -A x64
-          cmake --build . --config Release
-          copy Release\mimalloc.dll ..\mimalloc.dll
-          copy ..\bin\mimalloc-redirect.dll ..\mimalloc-redirect.dll
-        shell: cmd
-      # NOTE: mimalloc-redirect.dll is copied from mimalloc's checked-in bin/ directory, not from the
-      # build output - you are republishing a prebuilt binary. Flowtide calls the mi_* API explicitly
-      # via DllImport and does not use the malloc-override/redirect mechanism, so consider whether it
-      # needs to ship at all.
+        with:
+          arch: x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Do NOT use the "Visual Studio <N> <year>" generator: it resolves VS instances by major
+          # version and breaks whenever the hosted image's VS moves. Ninja + the msvc-dev-cmd
+          # environment is version independent.
+          # PowerShell does not abort on a failed native command, so $LASTEXITCODE is checked
+          # explicitly after every cmake invocation - otherwise a configure error surfaces much
+          # later as a confusing "file not found" on the copy.
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+          # Ninja is single-config: output lands in build\, not build\Release\. Discover the dll
+          # instead of hardcoding either layout, so this survives a generator change.
+          $dll = Get-ChildItem build -Recurse -Filter 'mimalloc*.dll' |
+                 Where-Object { $_.Name -notlike '*redirect*' } | Select-Object -First 1
+          if (-not $dll) { throw "no mimalloc dll was produced under build\" }
+          Copy-Item $dll.FullName .\mimalloc.dll
+          Copy-Item bin\mimalloc-redirect.dll .\mimalloc-redirect.dll
+
+      - name: Verify PE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in 'mimalloc.dll','mimalloc-redirect.dll') {
+            if (-not (Test-Path $f)) { throw "$f was not produced" }
+            $len = (Get-Item $f).Length
+            if ($len -le 0) { throw "$f is empty" }
+            $fs = [IO.File]::OpenRead((Resolve-Path $f))
+            try {
+              $br = New-Object IO.BinaryReader($fs)
+              $fs.Position = 0x3C
+              $fs.Position = $br.ReadInt32() + 4
+              $machine = $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+            if ($machine -ne 0x8664) { throw ("{0}: COFF machine 0x{1:X4}, expected 0x8664 (x64)" -f $f, $machine) }
+            "  OK  $f ($len bytes, x64)"
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-win-x64
           path: |
             mimalloc.dll
             mimalloc-redirect.dll
-
+            
   build-android:
     runs-on: ubuntu-latest
     strategy:
