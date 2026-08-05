@@ -4,95 +4,284 @@ on:
   workflow_dispatch:
     inputs:
       mimalloc_tag:
-        description: "tag to build (e.g., v3.0.3)"
+        description: "tag to build (the currently committed natives are v3.3.2)"
         required: true
+        default: "v3.3.2"
+      arm64_baseline:
+        description: "arm64 ISA baseline. armv8.0 is portable; armv8.1 enables LSE atomics but SIGILLs on Cortex-A72 / RPi 4 / Graviton 1."
+        type: choice
+        default: "armv8.0"
+        options:
+          - armv8.0
+          - armv8.1
+
+permissions:
+  contents: read
+
+env:
+  # Single source of truth for the glibc invariant asserted by every Linux row.
+  MAX_GLIBC: "2.28"
 
 jobs:
+  # ---------------------------------------------------------------------------------------------
+  # All four Linux natives: glibc x64/arm64 and musl x64/arm64, one matrix, one verification step.
+  # ---------------------------------------------------------------------------------------------
   build-linux:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        architecture: [x64, arm64]
+        include:
+          - rid: linux-x64
+            runs_on: ubuntu-latest
+            # Pinned by digest: tags are mutable and this image is the entire reason the floor holds.
+            image: quay.io/pypa/manylinux_2_28_x86_64@sha256:012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+            libc: glibc
+            elf_machine: Advanced Micro Devices X86-64
+            expect_needed: libc.so.6
+            harden_arch: -fcf-protection=full
+            fortify: "3"
+            artifact: mimalloc-linux-x64
+          - rid: linux-arm64
+            # Native arm64 runner, not a cross-compile. Cross vs native is invisible in the ELF
+            # header but not necessarily in generated barriers/atomics, and an allocator is the worst
+            # place to find that out. If this label is unavailable, cross-compiling inside
+            # manylinux_2_28_x86_64 also reaches GLIBC_2.17 - but then the artifact has never
+            # executed on real arm64 hardware.
+            runs_on: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64@sha256:52e4da6e9348db7cd0b529a827623b62b7c1fe867ba515ae752fa13d41f7f46e
+            libc: glibc
+            elf_machine: AArch64
+            expect_needed: libc.so.6
+            harden_arch: -mbranch-protection=standard
+            fortify: "3"
+            artifact: mimalloc-linux-arm64
+          - rid: linux-musl-x64
+            runs_on: ubuntu-latest
+            image: alpine:3.21          # pinned, not :latest - unpinned makes the artifact irreproducible
+            libc: musl
+            elf_machine: Advanced Micro Devices X86-64
+            expect_needed: libc.musl-x86_64.so.1
+            harden_arch: -fcf-protection=full
+            # musl's __*_chk coverage is narrower than glibc's; =2 is what Alpine itself ships with.
+            fortify: "2"
+            artifact: mimalloc-linux-musl-x64
+          - rid: linux-musl-arm64
+            runs_on: ubuntu-24.04-arm
+            image: alpine:3.21
+            libc: musl
+            elf_machine: AArch64
+            expect_needed: libc.musl-aarch64.so.1
+            harden_arch: -mbranch-protection=standard
+            fortify: "2"
+            artifact: mimalloc-linux-musl-arm64
+    runs-on: ${{ matrix.runs_on }}
+    container: ${{ matrix.image }}
     steps:
+      # sh, not bash: the alpine image has no bash until the next step installs it.
+      - name: Install build tools
+        shell: sh
+        run: |
+          set -eu
+          if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache git build-base cmake linux-headers bash binutils
+          else
+            command -v cmake >/dev/null 2>&1 || dnf install -y cmake
+          fi
+          cmake --version
+          cc --version || gcc --version
+
       - uses: actions/checkout@v4
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
 
-      - run: |
-          sudo apt update
-          if [ "${{ matrix.architecture }}" == "arm64" ]; then
-            sudo apt install -y cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          else
-            sudo apt install -y cmake build-essential
+      - name: Record source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "mimalloc ${{ inputs.mimalloc_tag }} = $(git rev-parse HEAD)"
+
+      # The historical musl workaround stripped a <linux/prctl.h> include. Guarded so it fails loudly
+      # if upstream has changed, rather than silently no-op'ing and leaving a future maintainer to
+      # wonder why the musl binary behaves differently.
+      - name: Apply musl prctl workaround (guarded)
+        if: matrix.libc == 'musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q '#include <linux/prctl.h>' src/prim/unix/prim.c; then
+            echo "::notice::<linux/prctl.h> is absent at ${{ inputs.mimalloc_tag }} - this workaround is obsolete, delete the step."
+            exit 0
           fi
-
-      - run: |
-          mkdir -p build && cd build
-          if [ "${{ matrix.architecture }}" == "arm64" ]; then
-            cmake .. \
-              -DCMAKE_SYSTEM_NAME=Linux \
-              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-              -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-              -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-              -DCMAKE_BUILD_TYPE=Release
-          else
-            cmake .. -DMI_LOCAL_DYNAMIC_TLS=ON -DCMAKE_BUILD_TYPE=Release
-          fi
-          make
-          cp libmimalloc.so ../libmimalloc.so
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mimalloc-linux-${{ matrix.architecture }}
-          path: libmimalloc.so
-  build-linux-musl:
-    runs-on: ubuntu-latest
-    container: alpine:latest
-    steps:
-      - name: Install dependencies
-        run: apk add --no-cache git build-base cmake linux-headers
-
-      - uses: actions/checkout@v4
-        with:
-          repository: microsoft/mimalloc
-          ref: ${{ inputs.mimalloc_tag }}
-
-      - run: |
           sed -i 's|#include <linux/prctl.h>||g' src/prim/unix/prim.c
+          echo "applied prctl workaround"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ARMv8.1 LSE atomics SIGILL on ARMv8.0 cores. Compile-time only - there is no runtime
+          # dispatch and the RID scheme gives exactly one arm64 binary, so this is either/or.
+          OPT_ARCH=""
+          if [ "${{ matrix.elf_machine }}" = "AArch64" ] && [ "${{ inputs.arm64_baseline }}" = "armv8.0" ]; then
+            OPT_ARCH="-DMI_NO_OPT_ARCH=ON"
+          fi
+
+          # Hardening. Ubuntu patches these on by default, RHEL-family and Alpine toolchains do not,
+          # so moving off ubuntu-latest silently produces a LESS hardened binary than before:
+          #   -fcf-protection=full     NT_GNU_PROPERTY_TYPE_0 IBT/SHSTK. Without it glibc's loader
+          #                            treats the DSO as legacy and disables shadow-stack for the
+          #                            WHOLE process on dlopen (or fails the dlopen outright under
+          #                            glibc.cpu.x86_shstk=on). x86 only.
+          #   -fstack-protector-strong __stack_chk_fail
+          #   -D_FORTIFY_SOURCE        __memcpy_chk / __memset_chk / __realpath_chk
+          #   -Wl,--as-needed          drops a spurious libatomic.so.1 DT_NEEDED
+          # All verified to keep the GLIBC_2.17 floor intact.
+          CFLAGS_HARDEN="-O2 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=${{ matrix.fortify }} ${{ matrix.harden_arch }}"
+          LDFLAGS_HARDEN="-Wl,--as-needed -Wl,-z,relro,-z,now"
+
           mkdir -p build && cd build
-          cmake .. -DMI_LOCAL_DYNAMIC_TLS=ON -DCMAKE_BUILD_TYPE=Release
-          make
-          cp libmimalloc.so ../libmimalloc.so
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMI_LOCAL_DYNAMIC_TLS=ON \
+            ${OPT_ARCH} \
+            -DCMAKE_C_FLAGS="${CFLAGS_HARDEN}" \
+            -DCMAKE_CXX_FLAGS="${CFLAGS_HARDEN}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS_HARDEN}"
+          make -j"$(nproc)"
+          cp "$(readlink -f libmimalloc.so)" ../libmimalloc.so
+
+      - name: Verify ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          F=libmimalloc.so
+          WANT_MACHINE="${{ matrix.elf_machine }}"
+          WANT_NEEDED="${{ matrix.expect_needed }}"
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          ok()  { echo "  OK  $*"; }
+
+          [ -s "$F" ] || { echo "::error::$F missing or empty"; exit 1; }
+          echo "verifying ${{ matrix.rid }} (${{ matrix.libc }}, max glibc ${MAX_GLIBC})"
+
+          # NOTE: every check captures first and matches the variable. Under `set -o pipefail`,
+          # `readelf ... | grep -q` FAILS on success: grep -q exits at the first match, readelf takes
+          # SIGPIPE (141), and pipefail reports the pipeline as failed. That inverts every check and
+          # rejects exactly the good binaries. Do not "simplify" these back into pipelines.
+
+          machine=$(readelf -h "$F" | sed -n 's/^ *Machine: *//p')
+          [ "$machine" = "$WANT_MACHINE" ] && ok "machine: $machine" \
+            || err "machine is '$machine', expected '$WANT_MACHINE'"
+
+          needed=$(readelf -d "$F" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort)
+          echo "  DT_NEEDED: $(echo "$needed" | tr '\n' ' ')"
+          printf '%s' "$needed" | grep -q '^libatomic' \
+            && err "links libatomic (add -Wl,--as-needed)" || ok "no libatomic over-link"
+          printf '%s\n' "$needed" | grep -qx "$WANT_NEEDED" \
+            && ok "links $WANT_NEEDED" || err "expected DT_NEEDED $WANT_NEEDED"
+
+          vneed=$(readelf -V "$F" 2>/dev/null || true)
+          if [ "${{ matrix.libc }}" = "musl" ]; then
+            printf '%s\n' "$needed" | grep -qx 'libc.so.6' \
+              && err "musl build links glibc libc.so.6" || ok "does not link glibc"
+            printf '%s' "$vneed" | grep -q 'GLIBC_' \
+              && err "musl build carries GLIBC_ versioned symbols" || ok "no GLIBC_ requirements"
+          else
+            vers=$(printf '%s' "$vneed" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -uV)
+            [ -n "$vers" ] || err "no GLIBC_ requirements found - .gnu.version_r missing?"
+            max=$(printf '%s' "$vers" | tail -1)
+            echo "  glibc requirements: $(printf '%s' "$vers" | tr '\n' ' ')"
+            # version-sort compare, not lexical: 2.10 > 2.9
+            if [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ]; then
+              ok "max glibc requirement $max <= $MAX_GLIBC"
+            else
+              err "max glibc requirement is $max, exceeds the $MAX_GLIBC floor"
+              syms=$(readelf --dyn-syms -W "$F" || true)
+              echo "::error::symbols responsible: $(printf '%s' "$syms" | grep "GLIBC_$max" | awk '{print $8}' | sort -u | tr '\n' ' ')"
+            fi
+          fi
+
+          dynsyms=$(readelf --dyn-syms -W "$F" || true)
+          printf '%s' "$dynsyms" | grep -q '__stack_chk_fail' \
+            && ok "-fstack-protector present" || err "no __stack_chk_fail - -fstack-protector-strong was lost"
+
+          if [ "$WANT_MACHINE" = "Advanced Micro Devices X86-64" ]; then
+            notes=$(readelf -n "$F" 2>/dev/null || true)
+            printf '%s' "$notes" | grep -qE 'IBT|SHSTK' \
+              && ok "CET properties present (IBT/SHSTK)" \
+              || err "no IBT/SHSTK - -fcf-protection=full was lost; glibc will disable shadow-stack process-wide on dlopen"
+          fi
+
+          # arm64: report the TLS model and LSE atomic count. TPREL means MI_LOCAL_DYNAMIC_TLS did not
+          # take effect; LSE instructions present means the binary SIGILLs on ARMv8.0 cores.
+          if [ "$WANT_MACHINE" = "AArch64" ]; then
+            # Match TPR, not TPREL: readelf pads/truncates the reloc name column, so the full
+            # R_AARCH64_TLS_TPREL64 can appear as R_AARCH64_TLS_TPR. Grepping for 'TPREL' silently
+            # misses and reports OK on an initial-exec binary - i.e. the check passes the exact
+            # defect it exists to catch. -W widens the output but do not rely on it alone.
+            relocs=$(readelf -rW "$F" 2>/dev/null | grep -oE 'R_AARCH64_TLS[A-Z0-9_]*' | sort -u | tr '\n' ' ' || true)
+            echo "  TLS relocations: ${relocs:-none}"
+            if printf '%s' "$relocs" | grep -qE 'TPR'; then
+              err "initial-exec TLS ($relocs) - MI_LOCAL_DYNAMIC_TLS did not take effect"
+            else
+              ok "not using initial-exec TLS"
+            fi
+            lse=$(objdump -d "$F" 2>/dev/null | grep -cE '\b(cas|casa|casal|casl|casb|casab|casalb|caslb|swp|swpa|swpal|swpl|ldadd|ldadda|ldaddal|ldaddl|ldclr|ldclra|ldclral|ldeor|ldset|ldseta|ldsetal|stadd|staddl|stclr|stset)\b' || true)
+            echo "  ARMv8.1 LSE atomic instructions: ${lse:-0}"
+            if [ "${{ inputs.arm64_baseline }}" = "armv8.0" ] && [ "${lse:-0}" -gt 0 ]; then
+              err "armv8.0 requested but ${lse} LSE instructions present - these SIGILL on ARMv8.0 cores"
+            fi
+          fi
+
+          [ "$fail" -eq 0 ] || { echo "::error::${{ matrix.rid }} failed verification"; exit 1; }
+          echo "${{ matrix.rid }} OK"
+
+      - name: Strip
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(stat -c%s libmimalloc.so)
+          strip --strip-unneeded libmimalloc.so
+          echo "stripped: ${before} -> $(stat -c%s libmimalloc.so) bytes"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mimalloc-linux-musl-x64
+          name: ${{ matrix.artifact }}
           path: libmimalloc.so
 
   build-osx:
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
-        arch:
-          - x64
-          - arm64
+        arch: [x64, arm64]
     steps:
       - uses: actions/checkout@v4
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
-
       - run: |
+          set -euo pipefail
+          [ "${{ matrix.arch }}" = "x64" ] && OSX_ARCH="x86_64" || OSX_ARCH="arm64"
           mkdir -p build && cd build
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            cmake .. -DCMAKE_OSX_ARCHITECTURES="x86_64" -DCMAKE_BUILD_TYPE=Release
-          else
-            cmake .. -DCMAKE_OSX_ARCHITECTURES="arm64" -DCMAKE_BUILD_TYPE=Release
-          fi
-          make
-          cp libmimalloc.dylib ../libmimalloc.dylib
-
+          # Without an explicit deployment target the minimum macOS version floats with whatever the
+          # runner image happens to be - the same class of bug as the glibc floor, just quieter.
+          cmake .. \
+            -DCMAKE_OSX_ARCHITECTURES="${OSX_ARCH}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMI_LOCAL_DYNAMIC_TLS=ON
+          make -j"$(sysctl -n hw.ncpu)"
+          cp "$(readlink -f libmimalloc.dylib)" ../libmimalloc.dylib
+      - name: Verify Mach-O
+        run: |
+          set -euo pipefail
+          file libmimalloc.dylib
+          otool -l libmimalloc.dylib | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | head -8
+          [ "${{ matrix.arch }}" = "x64" ] && WANT=x86_64 || WANT=arm64
+          file libmimalloc.dylib | grep -q "$WANT" || { echo "::error::expected $WANT"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-osx-${{ matrix.arch }}
@@ -105,9 +294,7 @@ jobs:
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
-
       - uses: ilammy/msvc-dev-cmd@v1
-
       - run: |
           mkdir build
           cd build
@@ -115,7 +302,11 @@ jobs:
           cmake --build . --config Release
           copy Release\mimalloc.dll ..\mimalloc.dll
           copy ..\bin\mimalloc-redirect.dll ..\mimalloc-redirect.dll
-
+        shell: cmd
+      # NOTE: mimalloc-redirect.dll is copied from mimalloc's checked-in bin/ directory, not from the
+      # build output - you are republishing a prebuilt binary. Flowtide calls the mi_* API explicitly
+      # via DllImport and does not use the malloc-override/redirect mechanism, so consider whether it
+      # needs to ship at all.
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-win-x64
@@ -126,45 +317,37 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - abi: armeabi-v7a
-            target_dir: android-arm
-          - abi: arm64-v8a
-            target_dir: android-arm64
-          - abi: x86
-            target_dir: android-x86
-          - abi: x86_64
-            target_dir: android-x64
-
+          - { abi: armeabi-v7a, target_dir: android-arm }
+          - { abi: arm64-v8a,   target_dir: android-arm64 }
+          - { abi: x86,         target_dir: android-x86 }
+          - { abi: x86_64,      target_dir: android-x64 }
     steps:
       - uses: actions/checkout@v4
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
-
-      - run: sudo apt update && sudo apt install -y cmake unzip
-
+      - run: sudo apt-get update && sudo apt-get install -y cmake unzip
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r26d
           add-to-path: false
-
       - env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          mkdir -p build/${{ matrix.abi }}
+          set -euo pipefail
           cmake -S . -B build/${{ matrix.abi }} \
-                -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-                -DANDROID_ABI=${{ matrix.abi }} \
-                -DANDROID_NATIVE_API_LEVEL=21 \
-                -DMI_ANDROID=ON \
-                -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/${{ matrix.abi }}
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_NATIVE_API_LEVEL=21 \
+            -DMI_ANDROID=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/${{ matrix.abi }} -j"$(nproc)"
           mkdir -p ${{ matrix.target_dir }}
           cp build/${{ matrix.abi }}/libmimalloc.so ${{ matrix.target_dir }}/
-
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-${{ matrix.target_dir }}
@@ -177,62 +360,93 @@ jobs:
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
-
       - run: brew install cmake --formula
-
       - run: |
+          set -euo pipefail
           mkdir -p build && cd build
-          cmake .. \
-            -G Xcode \
+          cmake .. -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
-            -DMI_IOS=ON \
-            -DMI_BUILD_SHARED=OFF \
-            -DMI_BUILD_STATIC=ON \
-            -DMI_BUILD_TESTS=OFF
+            -DMI_IOS=ON -DMI_BUILD_SHARED=OFF -DMI_BUILD_STATIC=ON -DMI_BUILD_TESTS=OFF
           cmake --build . --config Release --target mimalloc-static
           cp Release-iphoneos/libmimalloc.a ../libmimalloc.a
-
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-ios-arm64
           path: libmimalloc.a
 
+  # ---------------------------------------------------------------------------------------------
+  # Package. Previously this cp'd artifacts blindly, so a failed upstream job produced a silently
+  # incomplete dist that still looked like a successful run.
+  # ---------------------------------------------------------------------------------------------
   package:
-    # 1. ADD 'build-linux-musl' to the needs array
     needs:
-      [build-linux, build-linux-musl, build-osx, build-win-x64, build-android, build-ios-arm64]
+      - build-linux
+      - build-osx
+      - build-win-x64
+      - build-android
+      - build-ios-arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - run: |
-          # 2. ADD 'linux-musl-x64/native' to the mkdir array
-          mkdir -p dist/{linux-x64/native,linux-arm64/native,linux-musl-x64/native,osx-x64/native,osx-arm64/native,win-x64/native,android-arm/native,android-arm64/native,android-x86/native,android-x64/native,ios-arm64/native}
+      - name: Assemble dist
+        run: |
+          set -euo pipefail
+          # <rid>/native : <artifact name> : <file>
+          MAP="
+          linux-x64/native:mimalloc-linux-x64:libmimalloc.so
+          linux-arm64/native:mimalloc-linux-arm64:libmimalloc.so
+          linux-musl-x64/native:mimalloc-linux-musl-x64:libmimalloc.so
+          linux-musl-arm64/native:mimalloc-linux-musl-arm64:libmimalloc.so
+          osx-x64/native:mimalloc-osx-x64:libmimalloc.dylib
+          osx-arm64/native:mimalloc-osx-arm64:libmimalloc.dylib
+          win-x64/native:mimalloc-win-x64:mimalloc.dll
+          win-x64/native:mimalloc-win-x64:mimalloc-redirect.dll
+          android-arm/native:mimalloc-android-arm:libmimalloc.so
+          android-arm64/native:mimalloc-android-arm64:libmimalloc.so
+          android-x86/native:mimalloc-android-x86:libmimalloc.so
+          android-x64/native:mimalloc-android-x64:libmimalloc.so
+          ios-arm64/native:mimalloc-ios-arm64:libmimalloc.a
+          "
+          missing=0
+          for entry in $MAP; do
+            dest="dist/${entry%%:*}"; rest="${entry#*:}"
+            src="artifacts/${rest%%:*}/${rest#*:}"
+            mkdir -p "$dest"
+            if [ ! -s "$src" ]; then
+              echo "::error::missing or empty artifact: $src"
+              missing=$((missing+1)); continue
+            fi
+            cp "$src" "$dest/"
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing expected native(s) missing - refusing to publish a partial dist"
+            exit 1
+          fi
+          find dist -type f | sort
 
-          cp artifacts/mimalloc-linux-x64/libmimalloc.so dist/linux-x64/native/
-          cp artifacts/mimalloc-linux-arm64/libmimalloc.so dist/linux-arm64/native/
-
-          # 3. ADD the copy command for the new Alpine/musl binary
-          cp artifacts/mimalloc-linux-musl-x64/libmimalloc.so dist/linux-musl-x64/native/
-
-          cp artifacts/mimalloc-osx-x64/libmimalloc.dylib dist/osx-x64/native/
-          cp artifacts/mimalloc-osx-arm64/libmimalloc.dylib dist/osx-arm64/native/
-
-          cp artifacts/mimalloc-win-x64/mimalloc.dll dist/win-x64/native/
-          cp artifacts/mimalloc-win-x64/mimalloc-redirect.dll dist/win-x64/native/
-
-          cp artifacts/mimalloc-android-arm/libmimalloc.so dist/android-arm/native/
-          cp artifacts/mimalloc-android-arm64/libmimalloc.so dist/android-arm64/native/
-          cp artifacts/mimalloc-android-x86/libmimalloc.so dist/android-x86/native/
-          cp artifacts/mimalloc-android-x64/libmimalloc.so dist/android-x64/native/
-
-          cp artifacts/mimalloc-ios-arm64/libmimalloc.a dist/ios-arm64/native/
-
+      - name: Checksums and manifest
+        run: |
+          set -euo pipefail
+          (cd dist && find . -type f -exec sha256sum {} \; | sort -k2 > SHA256SUMS)
+          # Tags are mutable; the commit SHA is what actually identifies the source. Job-scoped env
+          # does not cross job boundaries, so resolve it here rather than passing it along.
+          SHA=$(git ls-remote https://github.com/microsoft/mimalloc "refs/tags/${{ inputs.mimalloc_tag }}^{}" | cut -f1)
+          [ -n "$SHA" ] || SHA=$(git ls-remote https://github.com/microsoft/mimalloc "refs/tags/${{ inputs.mimalloc_tag }}" | cut -f1)
+          cat > dist/BUILD-MANIFEST.txt <<EOF
+          mimalloc tag    : ${{ inputs.mimalloc_tag }}
+          mimalloc commit : ${SHA:-UNRESOLVED}
+          arm64 baseline  : ${{ inputs.arm64_baseline }}
+          glibc floor     : <= ${{ env.MAX_GLIBC }} (asserted per-RID during build)
+          built by        : ${{ github.repository }} run ${{ github.run_id }}
+          EOF
+          cat dist/BUILD-MANIFEST.txt
+          cat dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-runtimes
