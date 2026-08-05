@@ -43,10 +43,8 @@ jobs:
             artifact: mimalloc-linux-x64
           - rid: linux-arm64
             # Native arm64 runner, not a cross-compile. Cross vs native is invisible in the ELF
-            # header but not necessarily in generated barriers/atomics, and an allocator is the worst
-            # place to find that out. If this label is unavailable, cross-compiling inside
-            # manylinux_2_28_x86_64 also reaches GLIBC_2.17 - but then the artifact has never
-            # executed on real arm64 hardware.
+            # header but not necessarily in generated barriers/atomics, and an allocator is the
+            # worst place to find that out.
             runs_on: ubuntu-24.04-arm
             image: quay.io/pypa/manylinux_2_28_aarch64@sha256:52e4da6e9348db7cd0b529a827623b62b7c1fe867ba515ae752fa13d41f7f46e
             libc: glibc
@@ -75,38 +73,25 @@ jobs:
             fortify: "2"
             artifact: mimalloc-linux-musl-arm64
     runs-on: ${{ matrix.runs_on }}
-    container: ${{ matrix.image }}
+    # NOTE: deliberately NO `container:`. The runner injects Node into the job container to run
+    # JavaScript actions (actions/checkout, actions/upload-artifact) and only ships a musl Node for
+    # x64, so `container: alpine:*` on an arm64 runner fails outright with
+    #   "JavaScript Actions in Alpine containers are only supported on x64 Linux runners".
+    # Checking out and verifying on the host and running only the compiler under `docker run` avoids
+    # that entirely and keeps one code path for glibc and musl. The image is pulled for the runner's
+    # own architecture, so no --platform / QEMU is involved.
     steps:
-      # sh, not bash: the alpine image has no bash until the next step installs it.
-      - name: Install build tools
-        shell: sh
-        run: |
-          set -eu
-          if command -v apk >/dev/null 2>&1; then
-            apk add --no-cache git build-base cmake linux-headers bash binutils
-          else
-            command -v cmake >/dev/null 2>&1 || dnf install -y cmake
-          fi
-          cmake --version
-          cc --version || gcc --version
-
       - uses: actions/checkout@v4
         with:
           repository: microsoft/mimalloc
           ref: ${{ inputs.mimalloc_tag }}
 
       - name: Record source provenance
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "mimalloc ${{ inputs.mimalloc_tag }} = $(git rev-parse HEAD)"
+        run: echo "mimalloc ${{ inputs.mimalloc_tag }} = $(git rev-parse HEAD)"
 
-      # The historical musl workaround stripped a <linux/prctl.h> include. Guarded so it fails loudly
-      # if upstream has changed, rather than silently no-op'ing and leaving a future maintainer to
-      # wonder why the musl binary behaves differently.
+      # Done on the host so the container step is compilation only.
       - name: Apply musl prctl workaround (guarded)
         if: matrix.libc == 'musl'
-        shell: bash
         run: |
           set -euo pipefail
           if ! grep -q '#include <linux/prctl.h>' src/prim/unix/prim.c; then
@@ -116,20 +101,29 @@ jobs:
           sed -i 's|#include <linux/prctl.h>||g' src/prim/unix/prim.c
           echo "applied prctl workaround"
 
-      - name: Build
-        shell: bash
+      - name: Build in ${{ matrix.image }}
         run: |
           set -euo pipefail
+          # Written to a file rather than inlined into `sh -c` so there is no nested-quoting hazard.
+          cat > build-native.sh <<'SCRIPT'
+          #!/bin/sh
+          set -eu
+          if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache build-base cmake linux-headers >/dev/null
+          else
+            command -v cmake >/dev/null 2>&1 || dnf install -y cmake >/dev/null
+          fi
+          cc --version | head -1
 
-          # ARMv8.1 LSE atomics SIGILL on ARMv8.0 cores. Compile-time only - there is no runtime
+          # ARMv8.1 LSE atomics SIGILL on ARMv8.0 cores. Compile-time only: there is no runtime
           # dispatch and the RID scheme gives exactly one arm64 binary, so this is either/or.
           OPT_ARCH=""
-          if [ "${{ matrix.elf_machine }}" = "AArch64" ] && [ "${{ inputs.arm64_baseline }}" = "armv8.0" ]; then
+          if [ "$ELF_MACHINE" = "AArch64" ] && [ "$ARM64_BASELINE" = "armv8.0" ]; then
             OPT_ARCH="-DMI_NO_OPT_ARCH=ON"
           fi
 
-          # Hardening. Ubuntu patches these on by default, RHEL-family and Alpine toolchains do not,
-          # so moving off ubuntu-latest silently produces a LESS hardened binary than before:
+          # Ubuntu patches these on by default; RHEL-family and Alpine toolchains do not, so moving
+          # off ubuntu-latest silently produces a LESS hardened binary than before:
           #   -fcf-protection=full     NT_GNU_PROPERTY_TYPE_0 IBT/SHSTK. Without it glibc's loader
           #                            treats the DSO as legacy and disables shadow-stack for the
           #                            WHOLE process on dlopen (or fails the dlopen outright under
@@ -138,24 +132,34 @@ jobs:
           #   -D_FORTIFY_SOURCE        __memcpy_chk / __memset_chk / __realpath_chk
           #   -Wl,--as-needed          drops a spurious libatomic.so.1 DT_NEEDED
           # All verified to keep the GLIBC_2.17 floor intact.
-          CFLAGS_HARDEN="-O2 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=${{ matrix.fortify }} ${{ matrix.harden_arch }}"
-          LDFLAGS_HARDEN="-Wl,--as-needed -Wl,-z,relro,-z,now"
+          CF="-O2 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=$FORTIFY $HARDEN_ARCH"
 
           mkdir -p build && cd build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
             -DMI_LOCAL_DYNAMIC_TLS=ON \
-            ${OPT_ARCH} \
-            -DCMAKE_C_FLAGS="${CFLAGS_HARDEN}" \
-            -DCMAKE_CXX_FLAGS="${CFLAGS_HARDEN}" \
-            -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS_HARDEN}"
+            $OPT_ARCH \
+            -DCMAKE_C_FLAGS="$CF" \
+            -DCMAKE_CXX_FLAGS="$CF" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--as-needed -Wl,-z,relro,-z,now"
           make -j"$(nproc)"
-          cp "$(readlink -f libmimalloc.so)" ../libmimalloc.so
+          cp "$(readlink -f libmimalloc.so)" /src/libmimalloc.so
+          SCRIPT
+
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e ELF_MACHINE="${{ matrix.elf_machine }}" \
+            -e ARM64_BASELINE="${{ inputs.arm64_baseline }}" \
+            -e FORTIFY="${{ matrix.fortify }}" \
+            -e HARDEN_ARCH="${{ matrix.harden_arch }}" \
+            "${{ matrix.image }}" sh /src/build-native.sh
+
+          sudo chown "$(id -u):$(id -g)" libmimalloc.so   # docker writes as root
 
       - name: Verify ELF
-        shell: bash
         run: |
           set -euo pipefail
+          command -v readelf >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq binutils; }
+
           F=libmimalloc.so
           WANT_MACHINE="${{ matrix.elf_machine }}"
           WANT_NEEDED="${{ matrix.expect_needed }}"
@@ -214,8 +218,6 @@ jobs:
               || err "no IBT/SHSTK - -fcf-protection=full was lost; glibc will disable shadow-stack process-wide on dlopen"
           fi
 
-          # arm64: report the TLS model and LSE atomic count. TPREL means MI_LOCAL_DYNAMIC_TLS did not
-          # take effect; LSE instructions present means the binary SIGILLs on ARMv8.0 cores.
           if [ "$WANT_MACHINE" = "AArch64" ]; then
             # Match TPR, not TPREL: readelf pads/truncates the reloc name column, so the full
             # R_AARCH64_TLS_TPREL64 can appear as R_AARCH64_TLS_TPR. Grepping for 'TPREL' silently
@@ -239,7 +241,6 @@ jobs:
           echo "${{ matrix.rid }} OK"
 
       - name: Strip
-        shell: bash
         run: |
           set -euo pipefail
           before=$(stat -c%s libmimalloc.so)
@@ -305,18 +306,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Do NOT use the "Visual Studio <N> <year>" generator: it resolves VS instances by major
-          # version and breaks whenever the hosted image's VS moves. Ninja + the msvc-dev-cmd
-          # environment is version independent.
-          # PowerShell does not abort on a failed native command, so $LASTEXITCODE is checked
-          # explicitly after every cmake invocation - otherwise a configure error surfaces much
-          # later as a confusing "file not found" on the copy.
+          # version and fails with "could not find any instance of Visual Studio" whenever the hosted
+          # image's VS moves. Ninja plus the msvc-dev-cmd environment is version independent.
+          # PowerShell does not abort on a failed native command, so $LASTEXITCODE is checked after
+          # every cmake call - otherwise a configure error surfaces much later as a confusing
+          # "cannot find path ...\Release\mimalloc.dll" on the copy.
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
           cmake --build build
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
-          # Ninja is single-config: output lands in build\, not build\Release\. Discover the dll
-          # instead of hardcoding either layout, so this survives a generator change.
+          # Ninja is single-config so output lands in build\, VS generators use build\Release\.
+          # Discover it instead of hardcoding either layout.
           $dll = Get-ChildItem build -Recurse -Filter 'mimalloc*.dll' |
                  Where-Object { $_.Name -notlike '*redirect*' } | Select-Object -First 1
           if (-not $dll) { throw "no mimalloc dll was produced under build\" }
@@ -342,13 +343,17 @@ jobs:
             "  OK  $f ($len bytes, x64)"
           }
 
+      # NOTE: mimalloc-redirect.dll is copied from mimalloc's checked-in bin/ directory, not from the
+      # build output - you are republishing a prebuilt binary. Flowtide calls the mi_* API explicitly
+      # via DllImport and does not use the malloc-override/redirect mechanism, so consider whether it
+      # needs to ship at all.
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-win-x64
           path: |
             mimalloc.dll
             mimalloc-redirect.dll
-            
+
   build-android:
     runs-on: ubuntu-latest
     strategy:
@@ -482,6 +487,7 @@ jobs:
           EOF
           cat dist/BUILD-MANIFEST.txt
           cat dist/SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: mimalloc-runtimes
